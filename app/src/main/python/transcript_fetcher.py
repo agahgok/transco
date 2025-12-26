@@ -1,10 +1,10 @@
 import os
 import re
 import glob
-import sys
 import tempfile
 from urllib.parse import urlparse, parse_qs
 import yt_dlp
+
 
 def get_video_id(youtube_url):
     try:
@@ -19,6 +19,7 @@ def get_video_id(youtube_url):
         pass
     return None
 
+
 def _vtt_to_text(vtt_content):
     out = []
     for raw in vtt_content.splitlines():
@@ -27,9 +28,9 @@ def _vtt_to_text(vtt_content):
             continue
         if line == "WEBVTT":
             continue
-        if "-->" in line:   # timestamps
+        if "-->" in line:
             continue
-        if re.fullmatch(r"\d+", line):  # cue index
+        if re.fullmatch(r"\d+", line):
             continue
 
         line = re.sub(r"<[^>]+>", "", line).strip()
@@ -37,7 +38,6 @@ def _vtt_to_text(vtt_content):
             continue
         out.append(line)
 
-    # remove consecutive duplicates
     cleaned = []
     for line in out:
         if not cleaned or cleaned[-1] != line:
@@ -45,69 +45,107 @@ def _vtt_to_text(vtt_content):
 
     return "\n".join(cleaned).strip()
 
+
+def _pick_lang(available_langs, preferred=("tr", "en")):
+    """
+    available_langs: iterable of language codes (e.g. ['en', 'en-GB', 'de', ...])
+    preferred: preference order; if none match, fallback to the first available
+    """
+    if not available_langs:
+        return None
+    langs = list(available_langs)
+
+    # exact match first
+    for p in preferred:
+        if p in langs:
+            return p
+
+    # prefix match (e.g. preferred 'en' matches 'en-GB', 'en-US')
+    for p in preferred:
+        for l in langs:
+            if l.startswith(p + "-"):
+                return l
+
+    # fallback: first available
+    return langs[0]
+
+
 def get_transcript_text(youtube_url):
     video_id = get_video_id(youtube_url)
     if not video_id:
         return "Invalid YouTube URL"
 
-    # Use a temporary directory for yt-dlp operations
     with tempfile.TemporaryDirectory() as tmpdirname:
-        # Step 1: Try Manual Subtitles
-        # Corresponds to '--write-subs'
-        ydl_opts_manual = {
-            'skip_download': True,
-            'writesubtitles': True,
-            'writeautomaticsub': False,
-            'subtitleslangs': ['tr', 'en', 'en.*'], 
-            'subtitlesformat': 'vtt',
-            'outtmpl': f'{tmpdirname}/%(id)s.%(ext)s',
-            'quiet': True,
-            'no_warnings': True,
+        base_opts = {
+            "skip_download": True,
+            "subtitlesformat": "vtt",
+            "outtmpl": f"{tmpdirname}/%(id)s.%(ext)s",
+            "quiet": True,
+            "no_warnings": True,
         }
 
-        found_vtt = None
-
+        # 1) Önce bilgi çek: hangi manuel/otomatik caption dilleri var?
+        info_opts = dict(base_opts)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts_manual) as ydl:
-                ydl.download([youtube_url])
-            
-            vtts = sorted(glob.glob(f"{tmpdirname}/*.vtt"))
-            if vtts:
-                found_vtt = vtts
-        except Exception:
-            # Ignore errors and proceed to step 2 (Auto subs)
-            pass
+            with yt_dlp.YoutubeDL(info_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=False)
+        except Exception as e:
+            return f"Error fetching video info: {e}"
 
-        # Step 2: Try Auto Subtitles if Manual failed
-        if not found_vtt:
-            # Corresponds to '--write-auto-subs'
-            ydl_opts_auto = {
-                'skip_download': True,
-                'writesubtitles': False,
-                'writeautomaticsub': True,
-                'subtitleslangs': ['tr', 'en', 'en.*'], 
-                'subtitlesformat': 'vtt',
-                'outtmpl': f'{tmpdirname}/%(id)s.%(ext)s',
-                'quiet': True,
-                'no_warnings': True,
-            }
+        subtitles = info.get("subtitles") or {}
+        auto_caps = info.get("automatic_captions") or {}
+
+        manual_langs = list(subtitles.keys())
+        auto_langs = list(auto_caps.keys())
+
+        # 2) Manuel altyazı varsa onu indir
+        if manual_langs:
+            chosen = _pick_lang(manual_langs, preferred=("tr", "en"))
+            ydl_opts_manual = dict(base_opts)
+            ydl_opts_manual.update({
+                "writesubtitles": True,
+                "writeautomaticsub": False,
+                # sadece seçtiğimiz dili indir
+                "subtitleslangs": [chosen],
+            })
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts_manual) as ydl:
+                    ydl.download([youtube_url])
+            except Exception:
+                # manuel indirme başarısız olursa otomatiğe düş
+                pass
+        else:
+            chosen = None  # manuel yok
+
+        vtts = sorted(glob.glob(f"{tmpdirname}/*.vtt"))
+
+        # 3) Manuelden vtt çıkmadıysa (ya manuel yoktu ya da indirme başarısız)
+        #    YouTube otomatik altyazı varsa onu indir (dil filtresi olmadan / seçerek)
+        if not vtts:
+            if not auto_langs:
+                return "No subtitles found for this video (manual yok, auto da yok)."
+
+            chosen_auto = _pick_lang(auto_langs, preferred=("tr", "en"))
+            ydl_opts_auto = dict(base_opts)
+            ydl_opts_auto.update({
+                "writesubtitles": False,
+                "writeautomaticsub": True,
+                # seçtiğimiz auto dili indir (yoksa zaten _pick_lang ilk dili seçiyor)
+                "subtitleslangs": [chosen_auto],
+            })
+
             try:
                 with yt_dlp.YoutubeDL(ydl_opts_auto) as ydl:
                     ydl.download([youtube_url])
-                
-                vtts = sorted(glob.glob(f"{tmpdirname}/*.vtt"))
-                if vtts:
-                    found_vtt = vtts
             except Exception as e:
-                # If both failed, return error
-                pass
+                return f"Auto subtitles download failed: {e}"
 
-        if not found_vtt:
-             # Try one last ditch effort with the player_client workaround if standard methods failed
-             # But only if standard attempts failed, to match user logic priority
-            return "No subtitles found for this video (checked manual and auto)."
+            vtts = sorted(glob.glob(f"{tmpdirname}/*.vtt"))
+            if not vtts:
+                return "Auto subtitles were reported available but no VTT was downloaded."
 
-        # Rank files: prefer TR over EN
+        # 4) Birden fazla vtt çıkarsa: tr/en’i tercih ederek seç
         def rank(path):
             p = path.lower()
             if ".tr." in p or ".tr-" in p:
@@ -118,11 +156,11 @@ def get_transcript_text(youtube_url):
                 return 2
             return 999
 
-        best_vtt = sorted(found_vtt, key=lambda p: (rank(p), p))[0]
+        best_vtt = sorted(vtts, key=lambda p: (rank(p), p))[0]
 
         try:
             with open(best_vtt, "r", encoding="utf-8", errors="replace") as f:
                 vtt_content = f.read()
             return _vtt_to_text(vtt_content)
         except Exception as e:
-             return f"Error reading subtitle file: {e}"
+            return f"Error reading subtitle file: {e}"
