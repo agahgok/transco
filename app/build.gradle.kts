@@ -67,7 +67,7 @@ dependencies {
 chaquopy {
     defaultConfig {
         pip {
-            install("youtube-transcript-api")
+            install("yt-dlp")
         }
     }
 }
